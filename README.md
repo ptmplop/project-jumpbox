@@ -18,8 +18,8 @@ The .ovpn config file, authfile and customconfig file are mounted inside the con
 Build the container and run using the instructions below. 
 
 ```bash
-  cd jumpbox
-  docker build -t jumpbox .
+  cd project-jumpbox
+  docker build -t project-jumpbox .
 
   # - Jumpbox Proxy
   docker run -it --init --rm --name jumpbox-proxy \
@@ -31,7 +31,7 @@ Build the container and run using the instructions below.
     -e PORT=10097 \
     -e TZ=Europe/London \
     -e GEOAPIKEY={YOUR API KEY HERE} \
-     -v ~/Private/openvpn_configs/:/vpn:ro jumpbox"
+     -v ~/Private/openvpn_configs/:/vpn:ro jumpbox
 ```
 
 
