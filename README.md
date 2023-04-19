@@ -28,7 +28,7 @@ Build the container and run using the instructions below.
     -e AUTHFILE=jumpbox-auth \
     -e DCN=jumpbox-proxy \
     -e OVPNFILE=jumpbox.officeconnect.udp1194.ovpn \
-    -e PORT=10097 \
+    -e PORT=1080 \
     -e TZ=Europe/London \
     -e GEOAPIKEY={YOUR API KEY HERE} \
      -v ~/Private/openvpn_configs/:/vpn:ro jumpbox
