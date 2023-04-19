@@ -1,5 +1,12 @@
 #!/bin/bash
 
+# Our colour profiles made easy
+BOLD=$(tput bold)
+NORMAL=$(tput sgr0)
+PURPLE='\033[35m'
+GREEN='\033[92m'
+RED='\033[31m'
+
 JB="docker exec -it $(cat /etc/hostname) sh -l"
 
 function ctrl_c() {
