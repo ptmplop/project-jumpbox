@@ -69,18 +69,14 @@ connect_ovpn() {
         echo -n -e " ➡ Using specified authfile ($AUTHFILE)\n"
         sg vpn -c "openvpn --auth-nocache --daemon openvpn-client \
           --persist-tun --persist-key --log /var/log/openvpn.log \
-           --setenv PATH '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin' \
             --connect-retry 2 0 --script-security 2 --up /config/up.sh --up-restart \
-             --down /etc/openvpn/update-resolv-conf.sh --down-pre --auth-retry nointeract \
-              --config /vpn/$OVPNFILE --auth-user-pass /vpn/$AUTHFILE"
+             --auth-retry nointeract --config /vpn/$OVPNFILE --auth-user-pass /vpn/$AUTHFILE"
     else
-	    echo -n -e " ➡ No authfile was specified...\n"
+            echo -n -e " ➡ No authfile was specified...\n"
         sg vpn -c "openvpn --auth-nocache --daemon openvpn-client \
           --persist-tun --persist-key --log /var/log/openvpn.log \
-           --setenv PATH '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin' \
             --connect-retry 2 0 --script-security 2 --up /config/up.sh --up-restart \
-             --down /etc/openvpn/update-resolv-conf.sh --down-pre --auth-retry nointeract \
-              --config /vpn/$OVPNFILE"
+             --auth-retry nointeract --config /vpn/$OVPNFILE"
     fi
 }
 
@@ -98,6 +94,43 @@ wait_conn() {
             exit 1
         fi
     done
+}
+
+# Thanks to https://github.com/alfredopalhares/openvpn-update-resolv-conf
+setdns() {
+    for optionname in ${!foreign_option_*} ; do
+        option="${!optionname}"
+        part1=$(echo "$option" | cut -d " " -f 1)
+        if [ "$part1" == "dhcp-option" ] ; then
+            part2=$(echo "$option" | cut -d " " -f 2)
+            part3=$(echo "$option" | cut -d " " -f 3)
+
+            if [ "$part2" == "DNS" ] ; then
+                IF_DNS_NAMESERVERS="$IF_DNS_NAMESERVERS $part3"
+            fi
+
+            if [[ "$part2" == "DOMAIN" || "$part2" == "DOMAIN-SEARCH" ]] ; then
+                IF_DNS_SEARCH="$IF_DNS_SEARCH $part3"
+            fi
+        fi
+    done
+
+    R=""
+    if [ "$IF_DNS_SEARCH" ]; then
+        R="search "
+
+        for DS in $IF_DNS_SEARCH ; do
+            R="${R} $DS"
+        done
+        R="${R}
+        "
+    fi
+
+    for NS in $IF_DNS_NAMESERVERS ; do
+        R="${R}nameserver $NS
+        "
+    done
+    echo "$R" > /etc/resolv.conf
 }
 
 display() {
