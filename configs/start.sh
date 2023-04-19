@@ -1,5 +1,8 @@
 #!/bin/bash
 
+# Includes
+source /config/inc.sh
+
 # Trap and cleanup on ctrl-c
 trap ctrl_c INT
 
@@ -8,22 +11,11 @@ clear
 [[ -z "$DCN" ]] && echo "You must specify a valid container name" && exit 1
 [[ -z "$PORT" ]] && echo "You must specify a valid port" && exit 1
 
-# Includes
-source /config/inc.sh
-
-# Our colour profiles made easy
-BOLD=$(tput bold)
-NORMAL=$(tput sgr0)
-PURPLE='\033[35m'
-GREEN='\033[92m'
-RED='\033[31m'
-
 echo -n -e "${GREEN} ➡ Starting...\n"
 echo -n -e " ➡ Connect using: $JB\n"
 echo -n -e " ➡ Connecting the tunnel, this can take a while...\n"
 
 # -- Begin the setup
-
 tun_device  # - Configure tun device
 killswitch  # - Enable the VPN Killswitch
 
