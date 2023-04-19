@@ -23,7 +23,7 @@ Build the container and run using the instructions below.
 
   # - Jumpbox Proxy
   docker run -it --init --rm --name jumpbox-proxy \
-   --cap-add NET_ADMIN -p 10097:1080 \
+   --cap-add NET_ADMIN -p 1080:1080 \
     -e CUSTOMCONF=jumpbox-custom \
     -e AUTHFILE=jumpbox-auth \
     -e DCN=jumpbox-proxy \
