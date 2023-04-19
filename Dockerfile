@@ -23,7 +23,6 @@ COPY configs/inc.sh /config/
 COPY configs/flag.js /config/
 COPY configs/sockd.conf /etc/
 COPY configs/up.sh /config/
-COPY configs/restart.sh /config/
 COPY configs/motd.sh /config/
 COPY configs/motd_head /config/motd_head
 
@@ -32,7 +31,6 @@ RUN chmod 777 /start.sh
 RUN chmod 777 /config/inc.sh
 RUN chmod 777 /config/flag.js
 RUN chmod 777 /config/up.sh
-RUN chmod 777 /config/restart.sh
 RUN chmod 777 /config/motd.sh
 
 RUN touch /tmp/last
