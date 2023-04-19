@@ -38,7 +38,7 @@ Build the container and run using the instructions below.
 
 ## Environment Variables
 
-To run this project, you will need to add the following environment variables to your .env file
+To run this project, you will need to configure the container with environment variables.
 
 `CUSTOMCONF`
 
