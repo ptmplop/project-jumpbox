@@ -123,12 +123,12 @@ setdns() {
             R="${R} $DS"
         done
         R="${R}
-        "
+"
     fi
 
     for NS in $IF_DNS_NAMESERVERS ; do
         R="${R}nameserver $NS
-        "
+"
     done
     echo "$R" > /etc/resolv.conf
 }
