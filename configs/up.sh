@@ -1,10 +1,9 @@
 #!/bin/sh
 
-# Update the DNS options
-./etc/openvpn/update-resolv-conf.sh $@ &> /var/log/update-resolv-conf.log
+source /config/inc.sh
 
-# Nasty hack as update-resolv-conf suddenly stopped working in Docker
-cat $(for i in $(ls /etc/resolv.conf.*.openresolv); do echo $i; done | head -n 1) > /etc/resolv.conf
+# Update the DNS options
+setdns
 
 # Run Dante Socks5 proxy
 pidof sockd $>/dev/null || sockd -D -f /etc/sockd.conf &>/var/log/sockd.log &
