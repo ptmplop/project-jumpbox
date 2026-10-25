@@ -1,0 +1,5 @@
+# Build with no cache for updates
+docker build --no-cache --platform linux/arm64 -t jumpbox .
+
+# Or build to update codebase
+docker build --platform linux/arm64 -t jumpbox .
