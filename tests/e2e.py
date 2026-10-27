@@ -129,7 +129,7 @@ def _stage():
         mounts = []
         for src, dst in (("inc.sh", "/config/inc.sh"), ("start.sh", "/start.sh"),
                          ("vpn-restart.sh", "/usr/local/bin/vpn-restart"),
-                         ("sso-url.sh", "/usr/local/bin/sso-url")):
+                         ("sso-url.sh", "/usr/local/bin/sso-url"), ("motd.sh", "/config/motd.sh")):
             with open(os.path.join(CONFIGS, src), "rb") as f, open(os.path.join(stage, src), "wb") as g:
                 g.write(f.read())
             os.chmod(os.path.join(stage, src), 0o755)

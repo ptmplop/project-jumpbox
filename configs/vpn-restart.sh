@@ -10,11 +10,23 @@ sfile="/.conn_check"
 # under a minute). The lock goes when this script exits; connectOvpn below
 # runs with fd 9 closed so the openvpn daemon doesn't hold it for good. A
 # short wait rather than none: connCheck's watcher takes the lock for a
-# moment to see whether vpn-restart is running.
+# moment to see whether vpn-restart is running. start.sh holds it too until
+# its OpenVPN is running, as a run now would start a second one.
 exec 9>/run/vpn-restart.lock
 if ! lockWait 9 2; then
-  echo -e " ${violet}▸ ${rose}vpn-restart is already running${normal}"
-  exit 1
+  if [[ -e /run/jumpbox/starting ]]; then
+    if [[ $(cat /run/jumpbox/starting 2>/dev/null) == otp ]]; then
+      echo -e " ${violet}▸ ${rose}The container is waiting for the one-time code on its console: docker attach $(cat /etc/hostname), type it, then Ctrl-P Ctrl-Q${normal}"
+    else
+      echo -e " ${violet}▸ ${rose}The container is still starting OpenVPN, try again in a moment${normal}"
+    fi
+    exit 1
+  # start.sh lets go of the lock before its marker: with the marker gone, the
+  # lock may be free by now
+  elif ! flock -n 9; then
+    echo -e " ${violet}▸ ${rose}vpn-restart is already running${normal}"
+    exit 1
+  fi
 fi
 
 flag="${EMOJI:-🔄}"

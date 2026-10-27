@@ -26,6 +26,10 @@ per site with [Sockitt](#using-it-with-sockitt).
   proxy/SSH/shell commands, transfer totals and rates, gateway latency, and
   the time since the last reconnect. It has a compact layout for small
   panes, and prints plain log lines when run detached.
+- **A welcome screen in root shells** (`sh -l` / `bash -l`): the tunnel's
+  state and details, the kill switch and listeners, the ways in, your
+  aliases, and where to look when something's wrong, laid out for the size
+  of your terminal.
 - **Authentication**: certificate-only profiles, username/password, a
   one-time code (TOTP), an encrypted private key, and OpenVPN Access Server
   SAML / SSO (browser sign-in).
@@ -116,14 +120,14 @@ right commands.
 | `OVPNFILE` | yes | The profile's file name inside `/vpn`. |
 | `SSHPORT` | no | The host port you published for SSH. Defaults to `PORT + 2000`. |
 | `AUTHFILE` | no | A file in `/vpn` passed to `--auth-user-pass`: the username on line 1 and the password on line 2. |
-| `OTP` | no | `true` for servers that want a one-time code. The code goes on the line after the `AUTHFILE` contents, so an `AUTHFILE` holding just the username sends the code as the password. |
-| `OTPIN` | no | The one-time code for `OTP=true`. Without it, the container asks for one at startup. |
+| `OTP` | no | `true` for servers that want a one-time code (`true` or `false`: anything else stops the container at startup). The code goes on the line after the `AUTHFILE` contents, so an `AUTHFILE` holding just the username sends the code as the password. |
+| `OTPIN` | no | The one-time code for `OTP=true`. Without it, the container asks for one at startup; started detached, it waits for it on its console (`docker attach`), and a shell's welcome screen and `vpn-restart` say so. |
 | `PRIVKEY` | no | The passphrase for an encrypted private key in the profile (used with `OTP=true`). |
 | `OPITEM` | no | A 1Password secret reference for `vpn-restart` to read a fresh code from, if you install the `op` CLI in the container and give it a token (which, like any `-e` value, `docker inspect` shows). Otherwise `vpn-restart` asks for one. |
 | `SSO` | no | `true` for OpenVPN Access Server SAML / web sign-in. See [SSO sign-in](#sso-sign-in). |
 | `ROUTEALL` | no | `true` adds `--redirect-gateway def1`: routes all traffic through the tunnel when the profile doesn't already. |
 | `CONNCHECK` | no | `tunnel` reports "connected" once OpenVPN is up, rather than when `8.8.8.8` / `1.1.1.1` answer a ping through the tunnel. For VPNs that block ping. |
-| `CUSTOMCONF` | no | A file in `/vpn` run as a root shell script after OpenVPN and sshd start: add aliases, install packages, set up SSH keys. |
+| `CUSTOMCONF` | no | A file in `/vpn` run as a root shell script after OpenVPN and sshd start: add aliases, install packages, set up SSH keys. Aliases go in `/root/.profile` (`echo "alias db='ssh admin@10.20.0.5'" >> /root/.profile`), where root login shells (`sh -l` / `bash -l`) pick them up and the welcome screen lists them. |
 | `GEOAPIKEY` | no | An [ip2location.io](https://www.ip2location.io/) API key for the exit country and flag on the panel. Without a working key, the panel shows just the IP. |
 | `TZ` | no | Time zone for log timestamps, e.g. `UTC`. |
 
@@ -180,6 +184,42 @@ never leaves lines behind. The badge and border colour follow the state:
   <img src="docs/screenshots/compact.png" width="490" alt="The compact panel used in panes smaller than 66 by 10"><br>
   <sub>The compact layout, for panes smaller than 66 × 10</sub>
 </p>
+
+## The shell
+
+`docker exec -it <container> sh -l` (or `bash -l`) opens a root shell
+inside the tunnel. Before the first prompt it shows where things stand, in
+the panel's colours: the tunnel's state and exit, the kill switch and the
+listeners, how to reach the jumpbox, the tunnel's details (server, cipher,
+TLS and key agreement, address, routing, DNS), the aliases in
+`/root/.profile` (where a `CUSTOMCONF` script puts them), and the commands
+and logs to reach for.
+
+<p align="center">
+  <img src="docs/screenshots/motd.png" width="880" alt="The welcome screen in a root shell at 100 columns: JUMPBOX in large gradient letters beside the connection state, exit country and IP and the protection checks, then cards for access and for the tunnel's details side by side, the aliases as chips, and help"><br>
+  <sub>The welcome screen when you open a login shell in the container, at 100 columns</sub>
+</p>
+
+It fits itself to the terminal, from three plain lines in a tiny pane and
+a compact panel in a narrow one to ACCESS and TUNNEL side by side from
+about 100 columns (stacked when one would be mostly blank, as after
+OpenVPN stops), and it keeps to the window's height, so its top doesn't
+scroll away under the prompt. When the tunnel is down it turns red, names
+the server it's retrying (or says OpenVPN has stopped, and why when that's
+known) and what to run, or says OpenVPN is starting while the container is
+still on its way; waiting on an SSO sign-in turns it amber, and so does a
+protection that's off while connected (the kill switch, the IPv6 block, a
+listener, the watcher).
+
+<p align="center">
+  <img src="docs/screenshots/motd-down.png" width="720" alt="The welcome screen in an 80 by 24 terminal while the tunnel is down: red gradient, the server being retried, the message with vpn-restart, and the last connection's tunnel details dimmed"><br>
+  <sub>In an 80 × 24 terminal, with the tunnel down: the last connection's details are dimmed</sub>
+</p>
+
+It only reads the container, with no network calls, and only interactive
+login shells as root get it: not a plain `sh` or `bash` without `-l`, not
+the SSH user, and not a shell given a command, so
+`docker exec <container> bash -lc '...'` prints just the command's output.
 
 ## SSO sign-in
 
@@ -315,11 +355,12 @@ At startup, [`start.sh`](configs/start.sh) runs these steps from
    Allowed: loopback, established connections, the Docker network, `tun0`,
    and any process in the `vpn` group.
 2. **`connectOvpn`**: pins the profile's server hostnames in `/etc/hosts`,
-   then starts OpenVPN as a daemon under the `vpn` group. On every
-   (re)connect, [`up.sh`](configs/up.sh) writes the pushed DNS servers to
-   `/etc/resolv.conf` and makes sure the SOCKS5 proxy is running. The proxy
-   is [Dante](https://www.inet.no/dante/), listening on `eth0:1080`, egress
-   `tun0` only.
+   then starts OpenVPN as a daemon under the `vpn` group (till it's
+   running, `vpn-restart` waits and then gives up: it would start a second
+   one). On every (re)connect, [`up.sh`](configs/up.sh) writes the pushed
+   DNS servers to `/etc/resolv.conf` and makes sure the SOCKS5 proxy is
+   running. The proxy is [Dante](https://www.inet.no/dante/), listening on
+   `eth0:1080`, egress `tun0` only.
 3. **`sshdStart`** and **`connCheck`**: sshd, and a watcher that checks the
    tunnel every 5 seconds. It re-pins server addresses after a long outage
    and stops OpenVPN when an SSO window lapses.
@@ -336,11 +377,19 @@ of test:
 
 - **mock**: the real panel against a fake OpenVPN and a veth "tunnel", no
   VPN needed. Covers every layout and size, resizes, key presses, stop
-  signals, and hostile geo-lookup data.
+  signals, and hostile geo-lookup data. It also opens login shells in the
+  mock for the welcome screen: every layout from the three-line one up,
+  every state, a healthy connection and one needing attention, hostile and
+  odd data (a net30 tunnel, an IPv6 server, a 100 MB log), Ctrl-C, the
+  prompt's line editing, and the scripted logins that must not get it; and
+  draws it from fixtures ([`tests/motd`](tests/motd)) for states too rare or
+  short-lived to set up there. And the OpenVPN options `connectOvpn` picks
+  for each `OTP` and `AUTHFILE` setting.
 - **e2e**: the real `start.sh` against a throwaway OpenVPN server in Docker,
   using a test PKI generated on first run. Covers the main flow, SSO (with
-  a scripted sign-in), outages, a server moving to a new address, and
-  `vpn-restart` locking.
+  a scripted sign-in), outages, a server moving to a new address,
+  `vpn-restart` locking, and the tunnel details the welcome screen reads
+  from a real connection.
 
 ```sh
 cd tests
@@ -366,10 +415,12 @@ configs/
   vpn-restart.sh    /usr/local/bin/vpn-restart
   sso-url.sh        /usr/local/bin/sso-url
   sockd.conf        Dante SOCKS5 config (sockd.sh starts it)
-  sshd_config, motd.sh, motd_head, openssl.cnf
+  motd.sh           the welcome screen in a root shell
+  sshd_config, openssl.cnf
 tests/
   suite.py          the test suite
   jbxterm.py        pty + pyte harness and screen checks
   e2e.py, e2e/      the local OpenVPN server rig
-  mock/             the mock environment for panel tests
+  mock/             the mock environment for the panel and welcome screen tests
+  motd/             what the welcome screen is drawn from, for its rarer states
 ```

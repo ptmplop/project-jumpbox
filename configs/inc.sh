@@ -334,7 +334,9 @@ connectOvpn() {
     extra+=" --redirect-gateway def1"
   fi
 
-  if [[ -n "$AUTHFILE" && -z "$OTP" ]]; then
+  # OTP is on only as "true" (as the next branch has it): OTP=false must not
+  # drop the AUTHFILE
+  if [[ -n "$AUTHFILE" && "$OTP" != "true" ]]; then
     echo -n -e " ${arrow} Using specified authfile (${cyan}$AUTHFILE${white})${normal}\n"
     sg vpn -c "openvpn --auth-nocache --daemon openvpn-client \
       --persist-tun --persist-key --log /var/log/openvpn.log \
@@ -344,16 +346,23 @@ connectOvpn() {
 
   elif [[ "$OTP" == "true" ]]; then
     if [[ -z "$OTPIN" ]]; then
+      # Waiting on the console: start.sh's marker says so meanwhile, for a
+      # shell's motd and vpn-restart
+      [[ -e /run/jumpbox/starting ]] && echo otp > /run/jumpbox/starting
       echo -n -e " ${arrow} Enter Your OTP: ${normal}"
       read -r OTPIN
+      [[ -s /run/jumpbox/starting ]] && : > /run/jumpbox/starting
     fi
 
+    # --askpass only with a passphrase: OpenVPN 2.7 stops at an empty one,
+    # key encrypted or not
+    local ask=""
+    [[ -n "$PRIVKEY" ]] && ask="--askpass <(echo \"$PRIVKEY\")"
     echo -n -e " ${arrow} Using specified authfile (${cyan}$AUTHFILE${white})${normal}\n"
     sg vpn -c "openvpn --auth-nocache --daemon openvpn-client \
       --persist-tun --persist-key --log /var/log/openvpn.log \
       --connect-retry 2 0 --script-security 2 --up /config/up.sh --up-restart \
-      --auth-retry nointeract --config /vpn/$OVPNFILE \
-      --askpass <(echo \"$PRIVKEY\") \
+      --auth-retry nointeract --config /vpn/$OVPNFILE $ask \
       --auth-user-pass <(cat /vpn/$AUTHFILE; echo \"$OTPIN\") $extra"
 
   else
@@ -368,12 +377,16 @@ connectOvpn() {
 # Print the sign-in URL if OpenVPN is currently waiting on an SSO login.
 # The server sends it as INFO_PRE,WEB_AUTH::<url> (or OPEN_URL:<url>) and
 # OpenVPN logs it; any later handshake, auth-failure or restart line in the
-# log means it's no longer the one being waited on.
+# log means it's no longer the one being waited on. Only the end of the log
+# is read: a sign-in being waited on is the last thing OpenVPN logged, and
+# all of a log that grew for days (a refused password retried every 2s)
+# takes seconds - for every shell's motd, and every 3s in the panel.
 ssoPending() {
   local url
   pgrep -x openvpn >/dev/null || return 0
-  url=$(grep -E "Info command was pushed by server \('(WEB_AUTH|OPEN_URL):|PUSH_REPLY|Initialization Sequence Completed|AUTH_FAILED|SIG(HUP|USR1|TERM)\[|Restart pause" \
-          /var/log/openvpn.log 2>/dev/null | tail -n1 \
+  url=$(tail -c 2000000 /var/log/openvpn.log 2>/dev/null \
+        | grep -E "Info command was pushed by server \('(WEB_AUTH|OPEN_URL):|PUSH_REPLY|Initialization Sequence Completed|AUTH_FAILED|SIG(HUP|USR1|TERM)\[|Restart pause" \
+        | tail -n1 \
         | sed -nE "s/.*pushed by server \('(WEB_AUTH:[^:]*:|OPEN_URL:)([^']+)'\).*/\2/p")
   # Only ever hand on a plain https URL - it's printed to the TTY with echo -e
   # and opened on the host, so URL characters only (no backslash escapes)
@@ -388,6 +401,34 @@ tunnelUp() {
   pgrep -x openvpn >/dev/null && ip link show tun0 &>/dev/null || return 1
   grep -E "Initialization Sequence Completed|SIG(HUP|USR1|TERM)\[|Restart pause|AUTH_FAILED" \
     /var/log/openvpn.log 2>/dev/null | tail -n1 | grep -q "Initialization Sequence Completed"
+}
+
+# Why OpenVPN isn't running, when that's known, into stopWhy as plain text:
+# what stopped it (an SSO sign-in that ran out its window, under vpn-restart
+# or the watcher), or the server's AUTH_FAILED as the last word in
+# OpenVPN's log
+stoppedWhy() {
+  stopWhy=""
+  { read -r stopWhy < /run/jumpbox/stopped; } 2>/dev/null
+  if [[ -z $stopWhy ]] && tail -n 200 /var/log/openvpn.log 2>/dev/null \
+       | grep -E 'AUTH_FAILED|Initialization Sequence Completed' | tail -n1 | grep -q AUTH_FAILED; then
+    stopWhy="The server refused the sign-in"
+  fi
+  plainText stopWhy "$stopWhy"
+}
+
+# sshHostPort <var>: the host port published for SSH (docker run -p).
+# SSHPORT when it maps ssh to something other than PORT+2000, ? when
+# neither is a number. 10#: a leading zero would otherwise make it octal
+# (or an error).
+sshHostPort() {
+  if [[ $SSHPORT =~ ^[0-9]+$ ]]; then
+    printf -v "$1" '%d' $(( 10#$SSHPORT ))
+  elif [[ $PORT =~ ^[0-9]+$ ]]; then
+    printf -v "$1" '%d' $(( 10#$PORT + 2000 ))
+  else
+    printf -v "$1" '%s' '?'
+  fi
 }
 
 # Seconds the server gave us to finish signing in (from the AUTH_PENDING line)
@@ -1289,7 +1330,7 @@ display() {
   local latency="" latText="" rxPrev="" txPrev="" prevT=0
   local rxText="" txText="" rxSpark="" txSpark="" latSpark="" agoText="???" agoCompact="???"
   local ip="" ipShown="" ipNote="Looking up the public IP..." ctn="" cc="" flag=""
-  local host="" hostShown osVer vpnVer sshPort='?' portShown ovpnShown
+  local host="" hostShown osVer vpnVer sshPort portShown ovpnShown
   local -a frame dropOrder painted rxHist txHist latHist
 
   auroraInit
@@ -1299,13 +1340,7 @@ display() {
   plainText vpnVer "$(openvpn --version | head -n1 | awk '{print $1 " " $2}')"
   plainText portShown "$PORT"
   plainText ovpnShown "$OVPNFILE"
-  # SSHPORT when the launcher maps ssh to something other than PORT+2000.
-  # 10#: a leading zero would otherwise make it octal (or an error).
-  if [[ $SSHPORT =~ ^[0-9]+$ ]]; then
-    sshPort=$(( 10#$SSHPORT ))
-  elif [[ $PORT =~ ^[0-9]+$ ]]; then
-    sshPort=$(( 10#$PORT + 2000 ))
-  fi
+  sshHostPort sshPort
   { read -r host < /etc/hostname; } 2>/dev/null
   plainText host "$host"
   fitText hostShown "$host" 31
@@ -1429,15 +1464,9 @@ display() {
       else
         # Nothing is retrying (it gave up after a failed or lapsed sign-in,
         # was stopped by vpn-restart, or died): say so rather than spin, and
-        # why when that's known - from whatever stopped it, or the server's
-        # AUTH_FAILED as the last word in OpenVPN's log
-        ovpnUp=0 sso="" stopWhy=""
-        { read -r stopWhy < /run/jumpbox/stopped; } 2>/dev/null
-        if [[ -z $stopWhy ]] && tail -n 200 /var/log/openvpn.log 2>/dev/null \
-             | grep -E 'AUTH_FAILED|Initialization Sequence Completed' | tail -n1 | grep -q AUTH_FAILED; then
-          stopWhy="The server refused the sign-in"
-        fi
-        plainText stopWhy "$stopWhy"
+        # why when that's known
+        ovpnUp=0 sso=""
+        stoppedWhy
       fi
 
       shown=$st

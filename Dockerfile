@@ -9,8 +9,13 @@ busybox-extras shadow-login wget net-tools iproute2 traceroute socat htop iotop 
 rsync less zip unzip tar inetutils-telnet netcat-openbsd iperf3 sshpass screen alpine-sdk \
 bash-completion openssh ipmitool fzf
 
-RUN echo 'export PS1="\e[0;34m [Project Jumpbox] | $DCN\e[0m \w # "' > ~/.profile
-RUN echo 'sh /config/motd.sh' >> ~/.profile
+# The prompt's colours inside \[ \], so the shell doesn't count them as
+# characters (long command lines wrapped in the wrong place)
+RUN echo 'export PS1="\[\e[0;34m\] [Project Jumpbox] | $DCN\[\e[0m\] \w # "' > ~/.profile
+# The welcome screen, for interactive shells only, and not one given a
+# command: the output of docker exec <container> bash -lc '...' (or -lic,
+# for an alias) stays the command's own
+RUN echo 'case $- in *c*) ;; *i*) sh /config/motd.sh ;; esac' >> ~/.profile
 
 RUN mkdir /config
 
@@ -20,7 +25,6 @@ COPY configs/sockd.conf /etc/
 COPY configs/sockd.sh /config/
 COPY configs/up.sh /config/
 COPY configs/motd.sh /config/
-COPY configs/motd_head /config/motd_head
 COPY configs/sshd_config /etc/ssh/sshd_config
 
 RUN chmod 755 /start.sh

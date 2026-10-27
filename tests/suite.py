@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""Aurora display test suite. Usage: suite.py [mock|e2e|cpu|all] [test-name-substring ...]
+"""Aurora display and motd test suite. Usage: suite.py [mock|e2e|cpu|all] [test-name-substring ...]
 
 Needs a python with pyte:  python3 -m venv .venv && .venv/bin/pip install pyte
 then e.g.                  JBX_DEV=1 .venv/bin/python suite.py all
 
-Mock tests run the real display() against mock/mock.sh (no VPN). E2E tests
+Mock tests run the real display() against mock/mock.sh (no VPN), and open
+login shells in it for the motd (configs/motd.sh). E2E tests
 run the real image (start.sh) against a local OpenVPN server (e2e.py); the
 throwaway PKI for it is made on first use in e2e/pki. Tests use only
 containers and networks named jbx-t<n>-* / jbx-t<n>. The image tested is
@@ -18,6 +19,7 @@ import concurrent.futures as cf
 import json
 import os
 import re
+import shlex
 import subprocess
 import sys
 import time
@@ -150,7 +152,9 @@ def t_resize_sequence():
     problems = []
     seq = [(7, 40), (11, 66), (30, 100), (5, 30), (10, 66), (9, 50), (40, 160), (2, 12), (10, 66), (7, 40), (10, 66)]
     try:
-        if not settle(run, "conn", 25):
+        # Connected and the IP looked up: every size checked below expects the IP
+        if not run.wait_for(lambda s: shows_state(s, "conn") and "Looking up" not in s.all_text()
+                            and not J.frame_problems(s), 25):
             problems.append("never connected")
         for i, (r, c) in enumerate(seq):
             run.resize(r, c)
@@ -1261,6 +1265,955 @@ def t_e2e_headless(n=10):
         E.teardown(n)
 
 
+# ------------------------------------------------------------------ motd
+# The welcome screen (configs/motd.sh) a login shell in the container prints.
+# Shells are opened the way the README opens one, docker exec -it
+# <container> bash -l (or sh -l), into a connected mock container, under a
+# pty of each size.
+
+MOTD_ENV = dict(DCN="jbx-mock", OVPNFILE="example-gateway-sso.ovpn")
+# The wide, medium and compact layouts at their edges, and the tiny one
+MOTD_SIZES = [(24, 80), (36, 120), (40, 160), (30, 100), (24, 64), (20, 50), (16, 40), (14, 30), (12, 30), (6, 20)]
+PROMPT = b"[Project Jumpbox]"
+CLEAR = b"\x1b[H\x1b[2J"
+NEVER = "the mock never connected, or its IP lookup never finished"
+# Twenty aliases with long names, as a CUSTOMCONF script would add them
+ALIASES = ("ssh-prod-database-primary ssh-prod-database-replica bastion-eu bastion-us alerts grafana kibana "
+           "jenkins build1 build2 build3 pve1 pve2 pve3 pve4 ipmi-rack1 ipmi-rack2 switch-core fw-edge vpn-test").split()
+# Each state's badge as the motd draws it (the panel's at its first tick),
+# long and short. The state is told by its badge: a word alone can't do it,
+# CONNECTED being a part of DISCONNECTED.
+MOTD_BADGES = {"conn": ("◉ CONNECTED", "◉ UP"), "down": ("✕ DISCONNECTED", "✕ DOWN"), "sso": ("◇ SIGN-IN", "◇ SSO")}
+# In the motd's own output: nothing but its colours (reset, bold, 24-bit
+# foreground and background) and line ends
+NOT_SGR = re.compile(rb"\x1b(?!\[(?:0|1|[34]8;2;\d+;\d+;\d+)m)")
+CONTROL = re.compile(rb"[\x00-\x09\x0b\x0c\x0e-\x1a\x1c-\x1f\x7f]")
+
+
+def motd_append(name, path, text):
+    """Append text to a file in the container, any bytes, no shell quoting involved."""
+    subprocess.run(["docker", "exec", "-i", name, "sh", "-c", f"cat >> {path}"], input=text.encode(), capture_output=True)
+
+
+def wait_until(fn, timeout, step=0.25):
+    """Poll fn() until it's true, for up to timeout seconds."""
+    end = time.monotonic() + timeout
+    while time.monotonic() < end:
+        if fn():
+            return True
+        time.sleep(step)
+    return False
+
+
+def listening(name, *ports):
+    """Something listens on each port (in hex, as /proc/net/tcp has them) in the container."""
+    t = mexec(name, "cat", "/proc/net/tcp", "/proc/net/tcp6").stdout
+    return all(re.search(rf":{p} [0-9A-F:]+ 0A ", t) for p in ports)
+
+
+def motd_mock(name, env=None, extra=None, healthy=False):
+    """A connected mock container to open shells in, its IP lookup done
+    (run.mock_ok: it got there). Returns the panel's run: keep it open,
+    closing it stops the container. healthy: with what a start.sh container
+    has as well - the kill switch and IPv6 block, SOCKS5 and sshd - so no
+    check needs attention."""
+    rm(name)
+    run = J.start(mock_cmd(name, env=dict(MOTD_ENV, **(env or {})), extra=extra), 10, 66)
+    run.mock_ok = bool(run.wait_for(lambda s: shows_state(s, "conn") and "Looking up" not in s.all_text(), 25))
+    if healthy and run.mock_ok:
+        mexec(name, "bash", "-c", "source /config/inc.sh; killSwitch; sockdStart; sshdStart")
+        run.mock_ok = wait_until(lambda: listening(name, "0438", "0016"), 15)
+    return run
+
+
+def motd_shell(name, rows, cols, shell="bash"):
+    """A login shell in the container, opened as the README opens one; the
+    run once its prompt is up. The motd's error log is emptied first, so
+    what's in it is this shell's."""
+    mexec(name, "sh", "-c", ": > /var/log/jumpbox-motd.log")
+    run = J.start(["docker", "exec", "-it", name, shell, "-l"], rows, cols,
+                  env=dict(os.environ, DOCKER_CLI_HINTS="false"))
+    run.wait_bytes(PROMPT, 15)
+    time.sleep(0.3)
+    return run
+
+
+def motd_close(run):
+    """Leave the shell (closing the pty alone leaves it running) and close the run."""
+    run.send(b"exit\r")
+    time.sleep(0.2)
+    run.close()
+
+
+def motd_checks(name, run, rows, cols):
+    """What every motd must do: get to the prompt with no error text; clear
+    the screen once, never the scrollback; write nothing but its colours
+    and line ends; no line wider than the pane, and its boxes' lines all one
+    width (a text measured wrong breaks a border); the top still on screen
+    above the prompt, however many rows that takes; the cursor shown and
+    line wrap on afterwards; nothing in its error log."""
+    probs = []
+    data, _ = run.data()
+    if PROMPT not in data:
+        probs.append("no prompt")
+    errs = J.stream_errors(data)
+    if errs:
+        probs.append(f"error text: {errs[:2]}")
+    if b"\x1b[3J" in data:
+        probs.append("the scrollback was wiped (\\e[3J)")
+    start = data.find(CLEAR)
+    if start < 0:
+        probs.append("no clear screen before the motd")
+    else:
+        # The motd's lines: from its clear to the end of its last one. What
+        # comes after (bash's bracketed-paste mode, the prompt) is the shell's.
+        start += len(CLEAR)
+        p = data.find(PROMPT, start)
+        end = data.rfind(b"\n", start, p if p >= 0 else len(data)) + 1 or start
+        motd = data[start:end]
+        m = NOT_SGR.search(motd)
+        if m:
+            probs.append(f"an escape that isn't a colour: {motd[m.start():m.start() + 12]!r}")
+        m = CONTROL.search(motd)
+        if m:
+            probs.append(f"a control byte: {motd[m.start():m.start() + 1]!r}")
+        widths = J.line_widths(motd)
+        for i, (w, t) in enumerate(widths):
+            if w > cols:
+                probs.append(f"line {i} is {w} cells wide in {cols} columns: {t[:80]!r}")
+        box = sorted({w for w, t in widths if t[:2] in (" ╭", " │", " ╰")})
+        if len(box) > 1:
+            probs.append(f"the boxes' lines aren't all one width: {box}")
+        height = motd.count(b"\n")
+        pw = J.line_widths(data[end:])[0][0]
+        prompt_rows = max(1, -(-pw // cols))
+        if height + prompt_rows > rows:
+            probs.append(f"{height} lines and the prompt's {prompt_rows} rows don't fit in {rows}: the top scrolled away")
+    scr = run.screen()
+    if scr.cursor_hidden or not scr.autowrap:
+        probs.append(f"left the cursor hidden ({scr.cursor_hidden}) or line wrap off ({not scr.autowrap})")
+    log = mexec(name, "cat", "/var/log/jumpbox-motd.log").stdout.strip()
+    if log:
+        probs.append(f"motd error log: {log[:400]}")
+    return probs
+
+
+def motd_want(state, rows, cols, caution=False):
+    """Text the motd shows for the mock at that size, besides its badge; a
+    tuple is any one of its texts, a pattern a match. caution: what the
+    mock as it starts is missing (the kill switch, the IPv6 block, SOCKS5
+    and sshd), each one shown, connected being CAUTION."""
+    want = ["10079"]
+    if cols >= 50:
+        want += ["12080", "198.51.100.147"]
+        # What it's doing and what to run, so neither state passes for the other
+        if state == "down":
+            want += ["Waiting for", "to start over"]
+        elif state == "stopped":
+            want += ["completed in time", "to reconnect"]
+        elif state == "starting":
+            want.append("OpenVPN is starting")
+        elif state == "starting-otp":
+            want.append("one-time code")
+        elif state == "sso":
+            want.append("sso-url")
+    if state == "conn" and rows >= 24 and cols >= 64:
+        # The tunnel's details, as mock.sh logs them
+        want.append("X25519MLKEM768")
+        if cols >= 80:
+            want += ["192.0.2.10:1194", "AES-256-GCM", "TLSv1.3", "10.99.0.2/24", ("◆ post-quantum", "◆ PQ")]
+    if caution and state == "conn":
+        if cols >= 30:
+            want += ["need attention", "kill switch off", "IPv6 open", "SOCKS5 down", "SSH down"]
+        else:
+            # The tiny layout: the four as a count
+            want.append(re.compile(r"UP ▲ 4"))
+    return want
+
+
+def motd_text_problems(scr, want):
+    t = scr.all_text()
+    probs = []
+    for w in want:
+        if isinstance(w, re.Pattern):
+            if not w.search(t):
+                probs.append(f"missing {w.pattern!r}")
+        elif not any(x in t for x in (w if isinstance(w, tuple) else (w,))):
+            probs.append(f"missing {w!r}")
+    return probs
+
+
+def motd_state_problems(scr, st):
+    """The badge says the state (stopped and starting are down), and no other badge is there."""
+    t = scr.all_text()
+    want = "down" if st in ("stopped", "starting", "starting-otp") else st
+    shown = [s for s, badges in MOTD_BADGES.items() if any(b in t for b in badges)]
+    return [] if shown == [want] else [f"the badge says {'/'.join(shown) or 'nothing'}, not {want}"]
+
+
+def motd_wide_problems(scr, cols):
+    """From 100 columns, the wide layout: ACCESS and TUNNEL side by side."""
+    if cols >= 100 and not any("ACCESS" in t and "TUNNEL" in t for t in scr.text):
+        return ["ACCESS and TUNNEL aren't side by side, as the wide layout has them"]
+    return []
+
+
+def t_motd_layouts():
+    """Every size, the tiny one too, twenty long aliases: within the pane,
+    the top on screen, the layout the size calls for, the essentials shown
+    - each check that needs attention among them."""
+    name = f"jbx-t{SLOT_MOCK}-motd"
+    title = "motd at every size, with twenty long aliases"
+    panel = motd_mock(name)
+    problems = []
+    try:
+        if not panel.mock_ok:
+            return result(title, [NEVER])
+        motd_append(name, "/root/.profile", "".join(f"alias {a}='ssh {a}'\n" for a in ALIASES))
+        for rows, cols in MOTD_SIZES:
+            run = motd_shell(name, rows, cols)
+            try:
+                scr = run.screen()
+                p = (motd_checks(name, run, rows, cols) + motd_state_problems(scr, "conn")
+                     + motd_text_problems(scr, motd_want("conn", rows, cols, caution=True))
+                     + motd_wide_problems(scr, cols))
+                if cols >= 80 and rows >= 24 and not any(a in scr.all_text() for a in ALIASES[:3]):
+                    p.append("no aliases shown")
+                if p:
+                    problems += [f"[{rows}x{cols}] {x}" for x in p] + [scr.dump()]
+            finally:
+                motd_close(run)
+    finally:
+        rm(name)
+        panel.close()
+    return result(title, problems)
+
+
+def t_motd_healthy():
+    """The screen users see every day: connected, with the kill switch, the
+    IPv6 block and both listeners up. Every size, without aliases and with
+    twenty: nothing shows as failed or needing attention."""
+    name = f"jbx-t{SLOT_MOCK}-motd-healthy"
+    title = "motd on a healthy connection, at every size, without aliases and with twenty"
+    panel = motd_mock(name, healthy=True)
+    problems = []
+    try:
+        if not panel.mock_ok:
+            return result(title, [NEVER + " (or its listeners never came up)"])
+        for tag in ("no aliases", "aliases"):
+            if tag == "aliases":
+                motd_append(name, "/root/.profile", "".join(f"alias {a}='ssh {a}'\n" for a in ALIASES))
+            for rows, cols in MOTD_SIZES:
+                run = motd_shell(name, rows, cols)
+                try:
+                    scr = run.screen()
+                    t = scr.all_text()
+                    p = (motd_checks(name, run, rows, cols) + motd_state_problems(scr, "conn")
+                         + motd_text_problems(scr, motd_want("conn", rows, cols)) + motd_wide_problems(scr, cols))
+                    # CAUTION is "N checks need attention", or "UP ▲ N" in the
+                    # tiny layout (a ▲ alone is the upload arrow); ◌ a check
+                    # that couldn't be read
+                    if "✕" in t or "◌" in t or "attention" in t or re.search(r"UP ▲ \d", t):
+                        p.append("something shows as failed, unknown or needing attention")
+                    if p:
+                        problems += [f"[{tag} {rows}x{cols}] {x}" for x in p] + [scr.dump()]
+                finally:
+                    motd_close(run)
+    finally:
+        rm(name)
+        panel.close()
+    return result(title, problems)
+
+
+def t_motd_states():
+    """Down, SSO pending, back up, stopped with a reason - before the
+    watcher has seen OpenVPN go as well as after - and starting (start.sh's
+    marker, OpenVPN not running yet), plain and waiting for the one-time
+    code: the motd's badge says which, and what to run or do. While it's
+    starting vpn-restart waits for start.sh's lock, then says so and does
+    nothing."""
+    name = f"jbx-t{SLOT_MOCK}-motd-states"
+    title = "motd states: down, sso, conn, stopped (unseen and seen), starting (and on the OTP); vpn-restart then"
+    panel = motd_mock(name)
+    problems = []
+
+    def look(tag, st):
+        for rows, cols in ((24, 80), (20, 50)):
+            run = motd_shell(name, rows, cols)
+            try:
+                scr = run.screen()
+                p = (motd_checks(name, run, rows, cols) + motd_state_problems(scr, st)
+                     + motd_text_problems(scr, motd_want(st, rows, cols, caution=True)))
+                if st.startswith("starting"):
+                    # Nothing to run yet, and the last run's reason doesn't stand
+                    p += [f"shows {x!r}" for x in ("to reconnect", "to start over", "completed in time", "stopped")
+                          if x in scr.all_text()]
+                if p:
+                    problems.extend([f"[{tag} {rows}x{cols}] {x}" for x in p] + [scr.dump()])
+            finally:
+                motd_close(run)
+
+    try:
+        if not panel.mock_ok:
+            return result(title, [NEVER])
+        for st in ("down", "sso", "conn", "stopped", "starting", "starting-otp"):
+            if st == "stopped":
+                # Held still, the watcher can't see OpenVPN go: the motd
+                # mustn't take its last word (connected) for it
+                pid = mexec(name, "cat", "/.conn_check_pid").stdout.strip()
+                if not pid.isdigit():
+                    problems.append("[stopped] no watcher to hold still")
+                    continue
+                mexec(name, "kill", "-STOP", pid)
+                mexec(name, "pkill", "-x", "openvpn")
+                mexec(name, "sh", "-c", "mkdir -p /run/jumpbox; echo 'SSO sign-in not completed in time' > /run/jumpbox/stopped")
+                if wait_until(lambda: mexec(name, "pgrep", "-x", "openvpn").returncode != 0, 10):
+                    look("stopped, unseen", st)
+                else:
+                    problems.append("[stopped] OpenVPN never went")
+                mexec(name, "kill", "-CONT", pid)
+                # Settled once the watcher has seen it go (it looks every 5s)
+                there = wait_until(lambda: mexec(name, "cat", "/.conn_check").stdout.strip() == "1", 20)
+            elif st == "starting":
+                there = mexec(name, "touch", "/run/jumpbox/starting").returncode == 0
+            elif st == "starting-otp":
+                # connectOvpn at its prompt for the code
+                there = mexec(name, "sh", "-c", "echo otp > /run/jumpbox/starting").returncode == 0
+            else:
+                set_state(name, st)
+                there = settle(panel, st, 20)
+            if not there:
+                problems.append(f"[{st}] the mock never got there")
+                continue
+            look(st, st)
+        # start.sh holds the lock till its OpenVPN runs. Gone ahead,
+        # vpn-restart's first step would be to delete tun0.
+        subprocess.run(["docker", "exec", "-d", name, "flock", "/run/vpn-restart.lock", "sleep", "29"], capture_output=True)
+        if wait_until(lambda: mexec(name, "flock", "-n", "/run/vpn-restart.lock", "true").returncode != 0, 5):
+            for marker, said in (("otp", "waiting for the one-time code on its console: docker attach"), ("", "still starting")):
+                mexec(name, "sh", "-c", f"echo {marker} > /run/jumpbox/starting" if marker else ": > /run/jumpbox/starting")
+                r = mexec(name, "vpn-restart")
+                if r.returncode != 1 or said not in r.stdout:
+                    problems.append(f"[vpn-restart while starting {marker}] exit {r.returncode}: {r.stdout.strip()[-200:]!r}")
+                if mexec(name, "ip", "link", "show", "tun0").returncode != 0:
+                    problems.append(f"[vpn-restart while starting {marker}] it went ahead: tun0 is gone")
+                    break
+        else:
+            problems.append("[vpn-restart while starting] couldn't take the lock to hold it")
+        mexec(name, "pkill", "-f", "sleep 29")
+    finally:
+        rm(name)
+        panel.close()
+    return result(title, problems)
+
+
+def t_motd_quiet():
+    """No motd unless an interactive shell writes to a terminal and wasn't given a command: scripted logins keep their output."""
+    name = f"jbx-t{SLOT_MOCK}-motd-quiet"
+    title = "motd stays out of scripted logins (bash -lc, -t, bash -lic / sh -lic, piped sh -l / bash -li)"
+    panel = motd_mock(name)
+    problems = []
+    try:
+        if not panel.mock_ok:
+            return result(title, [NEVER])
+        env = dict(os.environ, DOCKER_CLI_HINTS="false")
+        cases = (("bash -lc", ["docker", "exec", name, "bash", "-lc", "echo hi"], None, b"hi\n"),
+                 ("tty bash -lc", ["docker", "exec", "-t", name, "bash", "-lc", "echo hi"], None, b"hi\r\n"),
+                 ("tty bash -lic", ["docker", "exec", "-t", name, "bash", "-lic", "echo hi"], None, b"hi\r\n"),
+                 ("tty sh -lic", ["docker", "exec", "-t", name, "sh", "-lic", "echo hi"], None, b"hi\r\n"),
+                 ("sh -l, piped", ["docker", "exec", "-i", name, "sh", "-l"], b"echo hi\nexit\n", b"hi\n"),
+                 ("bash -li, piped", ["docker", "exec", "-i", name, "bash", "-li"], b"echo hi\nexit\n", b"hi\n"))
+        for tag, cmd, stdin, want in cases:
+            r = subprocess.run(cmd, input=stdin, capture_output=True, env=env, timeout=30)
+            if r.stdout != want:
+                problems.append(f"[{tag}] stdout {r.stdout[:200]!r}, expected {want!r}")
+    finally:
+        rm(name)
+        panel.close()
+    return result(title, problems)
+
+
+def t_motd_ash():
+    """sh -l (busybox ash), the shell command the panel shows: same motd, then the prompt."""
+    name = f"jbx-t{SLOT_MOCK}-motd-ash"
+    title = "motd under sh -l (busybox ash)"
+    panel = motd_mock(name)
+    problems = []
+    try:
+        if not panel.mock_ok:
+            return result(title, [NEVER])
+        run = motd_shell(name, 24, 80, shell="sh")
+        try:
+            scr = run.screen()
+            problems += (motd_checks(name, run, 24, 80) + motd_state_problems(scr, "conn")
+                         + motd_text_problems(scr, motd_want("conn", 24, 80, caution=True)))
+            if problems:
+                problems.append(scr.dump())
+        finally:
+            motd_close(run)
+    finally:
+        rm(name)
+        panel.close()
+    return result(title, problems)
+
+
+def t_motd_odd():
+    """Data the motd has to read as the system does: a point-to-point tun0
+    (topology net30, with the route to the server's own tunnel address it
+    pushes), the server over IPv6, resolv.conf as musl reads it (an indented
+    nameserver, one with a port, a fourth), aliases defined twice, two on a
+    line, after --, chained with ; and quoted whole, a line going on with
+    something else after ;, the last line with no newline, and a mount
+    point with a space in it."""
+    name = f"jbx-t{SLOT_MOCK}-motd-odd"
+    title = "motd with net30 tun0, an IPv6 server, musl's resolv.conf, odd alias lines, a mount with a space"
+    panel = motd_mock(name, extra=["-v", f"{T}/mock:/root/my share:ro"])
+    problems = []
+    try:
+        if not panel.mock_ok:
+            return result(title, [NEVER])
+        mexec(name, "sh", "-c", "ip addr flush dev tun0 && ip addr add 10.78.0.6 peer 10.78.0.5 dev tun0 "
+                                "&& ip route add 10.20.0.0/16 via 10.78.0.5 dev tun0 "
+                                "&& ip route add 10.78.0.1 via 10.78.0.5 dev tun0")
+        motd_append(name, "/var/log/openvpn.log", "2026-10-26 10:00:00 TCPv6_CLIENT link remote: [AF_INET6]2001:db8::10:1194\n")
+        # Two pushed servers as setdns writes them (the second indented, which
+        # musl skips), one with a port (not an address, so skipped too), then
+        # two more: musl takes the first three it can use
+        mexec(name, "sh", "-c", "printf 'search corp.example\\nnameserver 10.20.0.53\\n        nameserver 10.20.1.53\\n"
+                                "nameserver 10.20.9.53:53\\nnameserver 10.20.2.53\\nnameserver 10.20.3.53\\n"
+                                "nameserver 10.20.4.53\\n' > /etc/resolv.conf")
+        motd_append(name, "/root/.profile", "alias dup-probe='echo 1'\nalias dup-probe='echo 2'\n"
+                                            "alias two-a='echo a' two-b=\"echo \\\"b\\\" x=y\"\nalias -- opt-probe='echo c'\n"
+                                            "alias semi-probe='ls -la'; PATH=$PATH:/opt/tools/bin\n"
+                                            "alias chain-a='echo a'; alias chain-b='echo b'\n"
+                                            "alias 'quoted-probe=ls -la'\nalias last-probe='echo z'")
+        for rows, cols in ((36, 120), (40, 160)):
+            run = motd_shell(name, rows, cols)
+            try:
+                scr = run.screen()
+                t = scr.all_text()
+                p = motd_checks(name, run, rows, cols) + motd_state_problems(scr, "conn")
+                p += motd_text_problems(scr, ["10.78.0.6/32", "split, 1 route", "[2001:db8::10]:1194", "10.20.0.53",
+                                              "10.20.2.53", "10.20.3.53", "two-a", "two-b", "opt-probe", "semi-probe",
+                                              "chain-a", "chain-b", "quoted-probe", "last-probe", "/root/my share"])
+                for gone in ("10.20.1.53", "10.20.9.53", "10.20.4.53"):
+                    if gone in t:
+                        p.append(f"{gone} is shown, but the resolver doesn't use it")
+                if "PATH" in t:
+                    p.append("PATH (set after an alias on its line) is shown as an alias")
+                if t.count("dup-probe") != 1:
+                    p.append(f"dup-probe is shown {t.count('dup-probe')} times, not once")
+                if p:
+                    problems += [f"[{rows}x{cols}] {x}" for x in p] + [scr.dump()]
+            finally:
+                motd_close(run)
+    finally:
+        rm(name)
+        panel.close()
+    return result(title, problems)
+
+
+def t_motd_ctrlc():
+    """Ctrl-C while the motd runs ends the motd and nothing more: the rest of
+    ~/.profile, the aliases set up there, still runs, under bash -l and sh
+    -l. resolv.conf padded with comments holds the motd up long enough to
+    interrupt it."""
+    name = f"jbx-t{SLOT_MOCK}-motd-ctrlc"
+    title = "Ctrl-C during the motd keeps the rest of ~/.profile (bash -l, sh -l)"
+    panel = motd_mock(name)
+    problems = []
+    try:
+        if not panel.mock_ok:
+            return result(title, [NEVER])
+        motd_append(name, "/root/.profile", "alias ctrlc-probe='echo ok'\n")
+        mexec(name, "sh", "-c", "yes '# padding' | head -n 150000 >> /etc/resolv.conf")
+        for shell in ("bash", "sh"):
+            run = J.start(["docker", "exec", "-it", name, shell, "-l"], 24, 80, env=dict(os.environ, DOCKER_CLI_HINTS="false"))
+            try:
+                time.sleep(1.2)
+                data = run.data()[0]
+                if CLEAR in data or PROMPT in data:
+                    problems.append(f"[{shell}] the motd was done before Ctrl-C: nothing to interrupt")
+                    continue
+                off = len(data)
+                run.send(b"\x03")
+                if not run.wait_bytes(PROMPT, 15, start=off):
+                    problems.append(f"[{shell}] no prompt after Ctrl-C")
+                    continue
+                # Ended there: it never got as far as drawing
+                if run.data()[0].find(CLEAR, off) >= 0:
+                    problems.append(f"[{shell}] the motd went on after Ctrl-C")
+                run.send(b"alias ctrlc-probe\r")
+                if not run.wait_bytes(b"echo ok", 5):
+                    problems += [f"[{shell}] the alias after the motd in ~/.profile isn't defined", run.screen().dump()]
+            finally:
+                motd_close(run)
+    finally:
+        rm(name)
+        panel.close()
+    return result(title, problems)
+
+
+def t_motd_prompt():
+    """The prompt's colours are inside \\[ \\] (Dockerfile), so a command
+    line longer than the pane is edited where it's shown: Ctrl-A and an X
+    put the X at its start, under bash -l and sh -l."""
+    name = f"jbx-t{SLOT_MOCK}-motd-prompt"
+    title = "prompt: a long command line is edited in the right place (bash -l, sh -l)"
+    panel = motd_mock(name)
+    problems = []
+    try:
+        if not panel.mock_ok:
+            return result(title, [NEVER])
+        for shell in ("bash", "sh"):
+            run = motd_shell(name, 12, 60, shell)
+            try:
+                run.send(b"echo " + b"abcdefghijklmnopqrstuvwxyz" * 3)
+                time.sleep(0.5)
+                run.send(b"\x01X")
+                time.sleep(0.5)
+                scr = run.screen()
+                # The X at the start, and the line still whole up to the
+                # pane's edge (the mock's prompt is 34 cells): a prompt
+                # measured wrong redraws it short, or somewhere else
+                rows = [t.rstrip() for t in scr.text if "[Project Jumpbox]" in t]
+                if not rows or not rows[-1].endswith("/ # Xecho abcdefghijklmnopqrst"):
+                    problems += [f"[{shell}] the X isn't at the start of the line: {rows[-1] if rows else None!r}", scr.dump()]
+            finally:
+                run.send(b"\x03")
+                motd_close(run)
+    finally:
+        rm(name)
+        panel.close()
+    return result(title, problems)
+
+
+def t_motd_hostile():
+    """Hostile data in what the motd reads: the geo lookup (which the panel
+    cleans first) and, straight in where the motd's own checks are all there
+    is, /etc/profile's exports, the hostname, the OpenVPN log, resolv.conf,
+    an alias and a stop reason. Nothing runs, and nothing but colours reaches
+    the terminal (motd_checks)."""
+    name = f"jbx-t{SLOT_MOCK}-motd-hostile"
+    title = "motd with hostile geo, exports, hostname, log, resolv.conf, alias and stop reason"
+    rm(name)
+    cmd = mock_cmd(name, env=dict(MOTD_ENV, MOCK_GEO_FILE="/t/mock/geo-evil.json"))
+    cmd[cmd.index("--hostname") + 1] = "\x1b[2Jred"
+    panel = J.start(cmd, 10, 66)
+    problems = []
+    try:
+        if not panel.wait_for(lambda s: shows_state(s, "conn") and "Looking up" not in s.all_text(), 25):
+            return result(title, [NEVER])
+        # Escapes only in /etc/profile and ~/.profile, never $(...): the
+        # login shell runs those itself. OSC and CSI, in upper case as well,
+        # so a value that's upper-cased still shows it. The IP stays good
+        # for now: without one there's no country shown to look at.
+        motd_append(name, "/etc/profile", 'export IP="198.51.100.9"\nexport CC="\x1b]0;x\x07"\n'
+                                          'export CTN="\x1b[2JEvil\x1b]0;pwn\x07land"\n')
+        motd_append(name, "/root/.profile", "alias ev\x1b[2Jil='echo x'\nalias fine-one='echo y'\n")
+        motd_append(name, "/var/log/openvpn.log",
+                    "2026-10-26 10:00:00 UDPv4 link remote: [AF_INET]$(touch /tmp/pwned)\x1b[2J:1194\n"
+                    "2026-10-26 10:00:00 Data Channel: cipher 'AES\x1b[31m$(touch /tmp/pwned)\x1b]0;X\x07', peer-id: 0\n"
+                    "2026-10-26 10:00:00 Control Channel: TLSv1.3\x1b[2J, cipher x, key agreement: $(touch /tmp/pwned)\n")
+        motd_append(name, "/etc/resolv.conf",
+                    "nameserver \x1b[2J$(touch /tmp/pwned)\nnameserver 192.0.2.53\x1b]0;x\x07\n"
+                    "search \x1b[2Jevil `touch /tmp/pwned`\n")
+        for rows, cols in ((24, 80), (30, 120)):
+            run = motd_shell(name, rows, cols)
+            try:
+                scr = run.screen()
+                p = motd_checks(name, run, rows, cols)
+                for want in ("fine-one", "Evil"):
+                    if want not in scr.all_text():
+                        p.append(f"{want!r} isn't shown (the alias after the hostile one, the country)")
+                if p:
+                    problems += [f"[{rows}x{cols}] {x}" for x in p] + [scr.dump()]
+            finally:
+                motd_close(run)
+        # Stopped, with a hostile reason and now a hostile IP
+        mexec(name, "pkill", "-x", "openvpn")
+        mexec(name, "mkdir", "-p", "/run/jumpbox")
+        motd_append(name, "/run/jumpbox/stopped", "Stopped \x1b[2Jby \x1b]0;pwn\x07evil \x1b[31mred\n")
+        motd_append(name, "/etc/profile", 'export IP="\x1b[2J198.51.100.9"\n')
+        wait_until(lambda: mexec(name, "pgrep", "-x", "openvpn").returncode != 0, 10)
+        run = motd_shell(name, 30, 120)
+        try:
+            scr = run.screen()
+            p = motd_checks(name, run, 30, 120) + motd_state_problems(scr, "stopped")
+            if "evil" not in scr.all_text():
+                p.append("the stop reason isn't shown")
+            if p:
+                problems += [f"[stopped 30x120] {x}" for x in p] + [scr.dump()]
+        finally:
+            motd_close(run)
+        if mexec(name, "test", "-e", "/tmp/pwned").returncode == 0:
+            problems.append("hostile data ran a command (/tmp/pwned exists)")
+    finally:
+        rm(name)
+        panel.close()
+    return result(title, problems)
+
+
+def run_once(name, args, timeout):
+    """docker run --rm --name <name> <args>: its (returncode, stdout,
+    stderr), or None when it outlasts timeout. The container is gone
+    afterwards however it ended."""
+    rm(name)
+    try:
+        r = subprocess.run(["docker", "run", "--rm", "--name", name, *args], capture_output=True, timeout=timeout)
+        return r.returncode, r.stdout.decode("utf-8", "replace"), r.stderr.decode("utf-8", "replace")
+    except subprocess.TimeoutExpired:
+        return None
+    finally:
+        rm(name)
+
+
+# TUNNEL's last row left blank: an unwanted in MOTD_RENDERS
+BLANK_TUNNEL_END = object()
+# The renderer on fixtures (tests/motd: what motdCollect would have set),
+# for states too rare or too short-lived to set up in a mock, each at a
+# size where it once went wrong: (fixture, rows, cols, wanted, unwanted), a
+# pattern for a match
+MOTD_RENDERS = [
+    # Three DNS servers, room for only the first: it says how many more
+    ("many", 19, 67, ["· DNS +3"], []),
+    # An IPv6 nameserver too long to sit by its label, others after it: counted
+    ("dns6", 24, 104, [re.compile(r"DNS\s+3 servers")], []),
+    # Only the server known: no rows of dashes, and it never connected
+    ("no-handshake", 24, 80, ["not connected yet"], [" · - ", " · TLS -"]),
+    # The compact panel, the kill switch unknown: no blank row, the aliases kept
+    ("sso-unknown-ks", 20, 24, ["gitlab"], [re.compile(r"^\s*│\s*│\s*$", re.M)]),
+    # A dead SOCKS5's row doesn't carry the checks' count
+    ("down-3bad", 9, 48, [], [re.compile(r"SOCKS5.*✓")]),
+    # A short pane keeps the server being retried over the checks' count
+    ("down-socks-ssh", 13, 40, ["retrying"], []),
+    # The cipher unknown, TLS known: TLS by the server, the key agreement kept
+    ("tls-no-cipher", 15, 100, ["X25519MLKEM768"], []),
+    # TUNNEL as tall as its rows beside ACCESS
+    ("dns6-max", 30, 100, ["DNS"], [BLANK_TUNNEL_END]),
+    # Starting: said beside the badge as well, and nothing to run, in every
+    # layout; waiting for the one-time code, how to give it
+    ("starting", 30, 100, ["OpenVPN is starting"], ["to reconnect", "to start over", "stopped"]),
+    ("starting", 24, 80, [re.compile(r"DISCONNECTED\s+starting"), "OpenVPN is starting"],
+     ["to reconnect", "to start over", "stopped"]),
+    ("starting", 24, 64, ["OpenVPN is starting"], ["to reconnect", "to start over", "stopped"]),
+    ("starting", 20, 50, ["OpenVPN is starting"], ["to reconnect", "to start over", "stopped"]),
+    ("starting", 6, 20, ["starting"], ["vpn-restart"]),
+    ("starting-otp", 24, 80, ["one-time code on the console: docker attach 4c7e19a2f05d"],
+     ["OpenVPN is starting", "to reconnect", "to start over"]),
+    ("starting-otp", 12, 40, ["one-time", "docker attach 4c7e19a2f05d"], ["OpenVPN is starting", "to reconnect"]),
+    ("starting-otp", 6, 20, ["waiting for OTP"], ["vpn-restart"]),
+    # No server in the log: not logged yet, or further back than is read
+    ("no-server", 24, 80, ["not logged yet"], []),
+    ("aged-out", 24, 80, ["not in the recent log"], []),
+    ("tcp-first", 24, 80, ["retrying 192.0.2.20:443 · TCP"], []),
+]
+
+
+def motd_tunnel_rows(lines):
+    """TUNNEL's rows inside its borders, or None when there's no TUNNEL."""
+    for i, t in enumerate(lines):
+        k = t.find("╭─ TUNNEL")
+        if k < 0:
+            continue
+        e = t.find("╮", k)
+        rows = []
+        for t2 in lines[i + 1:]:
+            if len(t2) > k and t2[k] == "╰":
+                break
+            rows.append(t2[k + 1:e])
+        return rows
+    return None
+
+
+def t_motd_render():
+    """The renderer alone on the fixtures in MOTD_RENDERS: what each wants
+    and doesn't, within the pane and leaving the prompt its rows, its boxes'
+    lines one width, no error text."""
+    name = f"jbx-t{SLOT_MOCK}-motd-render"
+    title = "motd renderer on fixtures, at the sizes where each once went wrong"
+    script = ("source /config/inc.sh >/dev/null 2>&1; auroraInit; source <(sed '$d' /config/motd.sh)\n"
+              "for c in \"$@\"; do ( source /t/motd/${c%%:*}.sh; s=${c#*:}; motdRows=${s%x*} motdCols=${s#*x}\n"
+              "  printf '@@ %s %s\\n' \"$c\" \"${#dcn}\"; motdRender 2>&1 ); done")
+    r = run_once(name, ["--entrypoint", "bash", "-v", f"{T}:/t:ro", *E.dev_mounts(), IMAGE, "-c", script, "render"]
+                 + [f"{f}:{rows}x{cols}" for f, rows, cols, _, _ in MOTD_RENDERS], 120)
+    if r is None:
+        return result(title, ["the renderer was still going after 120s"])
+    frames, dcns, cur = {}, {}, None
+    for ln in r[1].split("\n"):
+        if ln.startswith("@@ "):
+            case, _, n = ln[3:].partition(" ")
+            cur, dcns[case] = frames.setdefault(case, []), int(n or 0)
+        elif cur is not None:
+            cur.append(re.sub(r"\x1b\[[0-9;]*m", "", ln))
+    problems = []
+    for f, rows, cols, want, unwanted in MOTD_RENDERS:
+        tag = f"[{f} {rows}x{cols}]"
+        lines = frames.get(f"{f}:{rows}x{cols}")
+        if lines is None:
+            problems.append(f"{tag} not drawn: {r[2][-300:]!r}")
+            continue
+        while lines and not lines[-1]:
+            lines.pop()
+        text = "\n".join(lines)
+        p = [f"missing {getattr(w, 'pattern', w)!r}" for w in want
+             if not (w.search(text) if isinstance(w, re.Pattern) else w in text)]
+        for w in unwanted:
+            if w is BLANK_TUNNEL_END:
+                tr = motd_tunnel_rows(lines)
+                if tr and not tr[-1].strip():
+                    p.append("TUNNEL's last row is blank")
+            elif w.search(text) if isinstance(w, re.Pattern) else w in text:
+                p.append(f"shows {getattr(w, 'pattern', w)!r}")
+        widths = [sum(J.cell_width(ch) for ch in t) for t in lines]
+        if max(widths, default=0) > cols:
+            p.append(f"a line {max(widths)} cells wide in {cols} columns")
+        box = sorted({w for w, t in zip(widths, lines) if t[:2] in (" ╭", " │", " ╰")})
+        if len(box) > 1:
+            p.append(f"the boxes' lines aren't all one width: {box}")
+        # The prompt after it, " [Project Jumpbox] | <DCN> / # "
+        prompt = max(1, -(-(26 + dcns.get(f"{f}:{rows}x{cols}", 0)) // cols))
+        if len(lines) + prompt > rows:
+            p.append(f"{len(lines)} lines and the prompt's {prompt} rows in {rows}: the top would scroll away")
+        if re.search(r"line \d+:|bash:|command not found", text):
+            p.append("error text")
+        if p:
+            problems += [f"{tag} {x}" for x in p] + [text]
+    return result(title, problems)
+
+
+# OpenVPN logs and what the motd takes from them: (name, log lines, or a
+# size to fill with a line that names no server, server, proto, logWhole)
+MOTD_LOGS = [
+    ("udp", ["UDPv4 link remote: [AF_INET]192.0.2.10:1194"], "192.0.2.10:1194", "UDP", "1"),
+    # TCP logs its link line only once connected: each try names the server
+    ("tcp refused", ["Attempting to establish TCP connection with [AF_INET]192.0.2.20:443",
+                     "TCP: connect to [AF_INET]192.0.2.20:443 failed: Connection refused"], "192.0.2.20:443", "TCP", "1"),
+    ("tcp ipv6", ["Attempting to establish TCP connection with [AF_INET6]2001:db8::20:443"], "[2001:db8::20]:443", "TCP", "1"),
+    ("unresolved", ["RESOLVE: Cannot resolve host address: vpn.example.test:1194 (Try again)"],
+     "vpn.example.test:1194", "", "1"),
+    ("resolved later", ["RESOLVE: Cannot resolve host address: vpn.example.test:1194 (Try again)",
+                        "UDPv4 link remote: [AF_INET]192.0.2.10:1194"], "192.0.2.10:1194", "UDP", "1"),
+    # A route's name that didn't resolve is logged the same way: not the server
+    ("route unresolved", ["UDPv4 link remote: [AF_INET]192.0.2.10:1194",
+                          "RESOLVE: Cannot resolve host address: nosuch.example.test:[AF_INET] (Name does not resolve)"],
+     "192.0.2.10:1194", "UDP", "1"),
+    # Hostile ones taken for nothing, and not over the server already known
+    ("hostile tcp try", ["Attempting to establish TCP connection with [AF_INET]$(touch${IFS}/tmp/pwned)\x1b[2J:443"],
+     "", "", "1"),
+    ("hostile resolve", ["RESOLVE: Cannot resolve host address: \x1b]0;x\x07evil.example:1194 (x)"], "", "", "1"),
+    ("hostile after", ["UDPv4 link remote: [AF_INET]192.0.2.10:1194",
+                       "Attempting to establish TCP connection with [AF_INET]$(touch${IFS}/tmp/pwned)\x1b[2J:443",
+                       "RESOLVE: Cannot resolve host address: $(touch${IFS}/tmp/pwned):1194 (x)"],
+     "192.0.2.10:1194", "UDP", "1"),
+    ("nothing yet", [], "", "", "1"),
+    # More than is read, the server's line further back
+    ("aged out", 2100000, "", "", "0"),
+]
+
+
+# resolv.conf as musl reads it: (name, contents, nameservers, search)
+MOTD_RESOLV = [
+    ("crlf", "nameserver 10.20.0.53\r\nsearch corp.example lab.example\r\n", "10.20.0.53", "corp.example lab.example"),
+    # Longer lines than its 255 bytes skipped whole
+    ("long line", "nameserver 10.20.7.53" + " " * 240 + "#\nnameserver 10.20.0.53\n", "10.20.0.53", ""),
+    ("scope", "nameserver fe80::53%eth0\nnameserver 10.20.0.53\n", "fe80::53 10.20.0.53", ""),
+    ("bare search", "search corp.example\nsearch\nnameserver 10.20.0.53\n", "10.20.0.53", ""),
+    # Not addresses, so no slot of the three
+    ("not addresses", "nameserver abc\nnameserver 10.20.9.53:53\nnameserver 10.20.0.53\n", "10.20.0.53", ""),
+]
+# Alias lines after the image's ~/.profile: (name, lines, the names defined)
+MOTD_ALIAS_LINES = [
+    ("chained", ["alias and-a='echo a' && alias and-b='echo b'; alias semi-c=1;alias semi-d=2"],
+     "and-a and-b semi-c semi-d"),
+    ("then something else", ["alias semi-probe='ls -la'; PATH=$PATH:/opt/tools/bin", "alias x=$(echo y=z)"],
+     "semi-probe x"),
+    ("quoted whole", ["alias 'q-a=ls -la' \"q-b=ls -A\""], "q-a q-b"),
+    ("seen before", ["alias d-a=1", "alias d-a=1", "  alias   d-b=2", "alias d-a=3"], "d-a d-b"),
+]
+
+
+def t_motd_collect():
+    """motdCollect on what it reads: OpenVPN logs (MOTD_LOGS) - the server
+    and its protocol from a link line, from TCP's tries or from a name that
+    didn't resolve, nothing from hostile lines, and whether all of the log
+    was read; resolv.conf as musl reads it (MOTD_RESOLV); alias lines
+    (MOTD_ALIAS_LINES)."""
+    name = f"jbx-t{SLOT_MOCK}-motd-collect"
+    title = "motd's collector on OpenVPN logs, resolv.conf and alias lines"
+    lines = ["source /config/inc.sh >/dev/null 2>&1; source <(sed '$d' /config/motd.sh); L=/var/log/openvpn.log"]
+    for case, log, *_ in MOTD_LOGS:
+        if isinstance(log, int):
+            lines.append(f"yes '2026-10-27 10:00:00 read from TUN/TAP : Input/output error' | head -c {log} > $L")
+        else:
+            lines.append("printf '%s\\n' " + " ".join(shlex.quote(f"2026-10-27 10:00:00 {x}") for x in log) + " > $L"
+                         if log else ": > $L")
+        lines.append(f"motdCollect 2>&1; printf '@@ %s|%s|%s|%s\\n' {shlex.quote(case)} \"$server\" \"$proto\" \"$logWhole\"")
+    for case, text, _, _ in MOTD_RESOLV:
+        lines.append(f"printf '%s' {shlex.quote(text)} > /etc/resolv.conf; motdCollect 2>&1; "
+                     f"printf '@@R %s|%s|%s\\n' {shlex.quote(case)} \"${{dns[*]}}\" \"$dnsSearch\"")
+    lines.append("cp /root/.profile /tmp/profile0")
+    for case, text, _ in MOTD_ALIAS_LINES:
+        lines.append(f"{{ cat /tmp/profile0; printf '%s\\n' {' '.join(shlex.quote(x) for x in text)}; }} > /root/.profile; "
+                     f"motdCollect 2>&1; printf '@@A %s|%s\\n' {shlex.quote(case)} \"${{aliases[*]}}\"")
+    lines.append("[[ -e /tmp/pwned ]] && echo PWNED")
+    r = run_once(name, ["--entrypoint", "bash", *E.dev_mounts(), IMAGE, "-c", "\n".join(lines)], 60)
+    if r is None:
+        return result(title, ["motdCollect was still going after 60s"])
+    _, out, err = r
+    got = {m.group(1): m.group(2, 3, 4) for m in re.finditer(r"^@@ ([^|\n]*)\|([^|\n]*)\|([^|\n]*)\|([^|\n]*)$", out, re.M)}
+    problems = []
+    for case, _, server, proto, whole in MOTD_LOGS:
+        if got.get(case) != (server, proto, whole):
+            problems.append(f"[{case}] server/proto/logWhole {got.get(case)}, expected {(server, proto, whole)}")
+    got = {m.group(1): m.group(2, 3) for m in re.finditer(r"^@@R ([^|\n]*)\|([^|\n]*)\|([^|\n]*)$", out, re.M)}
+    for case, _, dns, search in MOTD_RESOLV:
+        if got.get(case) != (dns, search):
+            problems.append(f"[resolv.conf {case}] nameservers/search {got.get(case)}, expected {(dns, search)}")
+    got = {m.group(1): m.group(2) for m in re.finditer(r"^@@A ([^|\n]*)\|([^|\n]*)$", out, re.M)}
+    for case, _, names in MOTD_ALIAS_LINES:
+        if got.get(case) != names:
+            problems.append(f"[aliases {case}] {got.get(case)!r}, expected {names!r}")
+    if "PWNED" in out:
+        problems.append("a hostile log line ran a command")
+    if re.search(r"line \d+:|bash:", out + err):
+        problems.append(f"error text: {(out + err)[-300:]!r}")
+    return result(title, problems)
+
+
+def t_connect_auth():
+    """connectOvpn's openvpn command (sg stubbed to print it) and the motd's
+    auth label, for an AUTHFILE with OTP unset, false and true (with a key
+    passphrase and without: an empty --askpass stops OpenVPN), and for none;
+    at its prompt for the code, start.sh's marker saying so till it's in;
+    and start.sh refusing an OTP that's neither true nor false rather than
+    sending the password without its code."""
+    name = f"jbx-t{SLOT_MOCK}-auth"
+    title = "connectOvpn's auth for OTP and AUTHFILE, the motd's label for it, start.sh's OTP check"
+    cases = (  # environment, in the command, not in it, the motd's label
+        ("AUTHFILE=office-auth", "--auth-user-pass /vpn/office-auth", None, "password"),
+        ("AUTHFILE=office-auth OTP=false", "--auth-user-pass /vpn/office-auth", None, "password"),
+        ("AUTHFILE=office-auth OTP=true OTPIN=123456", '--auth-user-pass <(cat /vpn/office-auth; echo "123456")',
+         "--askpass", "otp"),
+        ("AUTHFILE=office-auth OTP=true OTPIN=123456 PRIVKEY=sekrit", '--askpass <(echo "sekrit")', None, "otp"),
+        ("", None, "--auth-user-pass", "certificate"),
+    )
+    script = ("source /config/inc.sh >/dev/null 2>&1; source <(sed '$d' /config/motd.sh)\n"
+              "pinRemotes() { :; }; sg() { printf 'CMD %s\\n' \"$3\"; }\n"
+              "for c in \"$@\"; do ( [[ -n $c ]] && export $c; printf '@@ %s\\n' \"$c\"\n"
+              "  connectOvpn 2>&1 | grep '^CMD'; motdCollect 2>/dev/null; echo \"auth=$auth\" ); done\n"
+              # At its prompt for the code, start.sh's marker says so, and
+              # not once the code is in
+              "( printf '@@ prompt\\n'; export AUTHFILE=office-auth OTP=true; mkdir -p /run/jumpbox; : > /run/jumpbox/starting\n"
+              "  { sleep 0.5; cat /run/jumpbox/starting > /tmp/during; echo 654321; } | connectOvpn 2>&1 | grep '^CMD'\n"
+              "  printf 'MARK %s|%s\\n' \"$(cat /tmp/during)\" \"$(cat /run/jumpbox/starting)\" )")
+    r = run_once(name, ["--entrypoint", "bash", "-e", "OVPNFILE=client.ovpn", *E.dev_mounts(), IMAGE, "-c", script, "auth"]
+                 + [c[0] for c in cases], 60)
+    if r is None:
+        return result(title, ["connectOvpn was still going after 60s"])
+    outs = {b.split("\n", 1)[0]: b for b in r[1].split("@@ ")[1:]}
+    problems = []
+    for env, want, unwanted, label in cases:
+        out = outs.get(env, "")
+        cmd = " ".join(" ".join(ln.split()) for ln in out.split("\n") if ln.startswith("CMD"))
+        if not cmd:
+            problems.append(f"[{env or 'no AUTHFILE'}] no openvpn command: {out[-200:]!r}")
+            continue
+        if want and want not in cmd:
+            problems.append(f"[{env or 'no AUTHFILE'}] the command lacks {want!r}: {cmd[-240:]!r}")
+        if unwanted and unwanted in cmd:
+            problems.append(f"[{env or 'no AUTHFILE'}] the command has {unwanted!r}")
+        if f"auth={label}\n" not in out:
+            problems.append(f"[{env or 'no AUTHFILE'}] the motd's label isn't {label!r}: {out[-80:]!r}")
+    m = re.search(r"^MARK ([^|\n]*)\|([^|\n]*)$", outs.get("prompt", ""), re.M)
+    if not m or m.groups() != ("otp", ""):
+        problems.append(f"[OTP=true, no OTPIN] the marker while waiting for the code / after: {m.groups() if m else None}")
+    if 'echo "654321")' not in outs.get("prompt", ""):
+        problems.append("[OTP=true, no OTPIN] the code read at the prompt isn't in the command")
+    # Refused before anything starts; let through, start.sh would go on to
+    # connect (and, with no profile, wait out waitConn)
+    r = run_once(name, ["-e", "DCN=jbx-auth", "-e", "PORT=10079", "-e", "OVPNFILE=client.ovpn", "-e", "AUTHFILE=office-auth",
+                        "-e", "OTP=1", *E.dev_mounts(), IMAGE], 20)
+    if r is None:
+        problems.append("[start.sh, OTP=1] not refused: still running after 20s")
+    elif r[0] != 1 or "OTP must be true or false" not in r[1]:
+        problems.append(f"[start.sh, OTP=1] exit {r[0]}, not refused: {r[1][-200:]!r}")
+    return result(title, problems)
+
+
+def motd_times(name, n=5):
+    """The motd's run time, n times, as a login shell would see it."""
+    runs = []
+    for _ in range(n):
+        r = subprocess.run(["docker", "exec", "-t", name, "bash", "-c", "TIMEFORMAT=%3R; time bash /config/motd.sh"],
+                           capture_output=True, timeout=60, env=dict(os.environ, DOCKER_CLI_HINTS="false"))
+        m = re.search(rb"(\d+\.\d{3})\s*$", r.stdout)
+        if m:
+            runs.append(float(m.group(1)))
+    return runs
+
+
+def t_motd_time():
+    """The motd's own run time, connected, and down with 100 MB of OpenVPN
+    log (a refused password retried every 2s for a day or two), of which
+    only the end is read."""
+    name = f"jbx-t{SLOT_MOCK}-motd-time"
+    title = "motd run time, connected and down with a 100 MB log"
+    panel = motd_mock(name)
+    problems, info = [], {}
+    try:
+        if not panel.mock_ok:
+            return result(title, [NEVER])
+        info["seconds"] = motd_times(name)
+        set_state(name, "down")
+        if not settle(panel, "down", 20):
+            problems.append("the mock never went down")
+        mexec(name, "sh", "-c", "yes 'read from TUN/TAP : Input/output error (fd=7,code=5)' "
+                                "| head -c 100000000 >> /var/log/openvpn.log")
+        info["seconds_down_100mb"] = motd_times(name)
+        for key, limit in (("seconds", 0.3), ("seconds_down_100mb", 0.5)):
+            runs = info[key]
+            if len(runs) < 5:
+                problems.append(f"couldn't time it ({key}): {runs}")
+            elif sorted(runs)[2] > limit:
+                problems.append(f"{key}: median {sorted(runs)[2]:.3f}s, over the {limit}s budget")
+    finally:
+        rm(name)
+        panel.close()
+    return result(title, problems, **info)
+
+
+def t_e2e_motd(n=11):
+    """The motd against a real OpenVPN connection: the details it lifts from the log, tun0, DNS, the kill switch, the listeners."""
+    name = f"jbx-t{n}-motd"
+    title = "e2e motd: real tunnel details"
+    E.setup(n)
+    panel = J.start(E.client_cmd(n, name), 10, 66)
+    problems = []
+    try:
+        if not panel.wait_for(lambda s: shows_state(s, "conn") and "Looking up" not in s.all_text(), 60):
+            return result(title, ["never connected"])
+        run = motd_shell(name, 30, 120)
+        try:
+            scr = run.screen()
+            problems += motd_checks(name, run, 30, 120) + motd_state_problems(scr, "conn")
+            # The server's address changes from run to run: its port doesn't
+            problems += motd_text_problems(scr, ["UDP", ":1194", "AES-256-GCM", "TLSv1.3", "X25519", f"10.89.{n}.",
+                                                 "full tunnel", "1.1.1.1", str(29990 + n), str(31990 + n), "client.ovpn"])
+            # A healthy start.sh container: kill switch, IPv6 block, both
+            # listeners and the watcher all fine, and all read (◌: couldn't be)
+            if "✕" in scr.all_text() or "◌" in scr.all_text():
+                problems.append("a check shows as failed or unknown on a healthy connection")
+            if problems:
+                problems.append(scr.dump())
+        finally:
+            motd_close(run)
+        return result(title, problems, screen=scr.stripped())
+    finally:
+        panel.close()
+        E.teardown(n)
+
+
 def main():
     which = sys.argv[1] if len(sys.argv) > 1 else "all"
     filt = sys.argv[2:]
@@ -1275,11 +2228,16 @@ def main():
                   ("lookfail", t_lookup_failure_after_delay), ("dumb", t_term_dumb), ("modes", t_stray_modes),
                   ("odd", t_odd_data), ("ssoalive", t_compact_sso_alive), ("ratereset", t_rates_reset),
                   ("attach", t_attach_second_client), ("headless", t_headless_mock)]
+        tests += [("motd layouts", t_motd_layouts), ("motd healthy", t_motd_healthy), ("motd states", t_motd_states),
+                  ("motd quiet", t_motd_quiet), ("motd ash", t_motd_ash), ("motd odd", t_motd_odd),
+                  ("motd ctrlc", t_motd_ctrlc), ("motd prompt", t_motd_prompt), ("motd hostile", t_motd_hostile),
+                  ("motd time", t_motd_time), ("motd render", t_motd_render), ("motd collect", t_motd_collect),
+                  ("connect auth", t_connect_auth)]
     if which in ("e2e", "all"):
         tests += [("e2e main", t_e2e_main), ("e2e sso", t_e2e_sso), ("e2e ctrlc", t_e2e_ctrl_c_compact),
                   ("e2e lock", t_e2e_vpn_restart_lock), ("e2e newip", t_e2e_server_new_ip),
                   ("e2e outage", t_e2e_long_outage), ("e2e gone", t_e2e_server_gone),
-                  ("e2e lapse", t_e2e_sso_lapse), ("e2e headless", t_e2e_headless)]
+                  ("e2e lapse", t_e2e_sso_lapse), ("e2e headless", t_e2e_headless), ("e2e motd", t_e2e_motd)]
     if which in ("cpu", "all"):
         tests += [("cpu", t_cpu_vs_old)]
     if filt:

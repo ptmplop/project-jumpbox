@@ -6,11 +6,11 @@
 #   - tun0 as one end of a veth pair, so both byte counters move: tx from a
 #     ping to a static neighbour, rx from raw frames written into the peer
 #   - the openvpn log lines and /tmp/last that connCheck (CONNCHECK=tunnel),
-#     ssoPending and the display read; /t/state.sh changes them
+#     ssoPending, the display and the motd read; /t/state.sh changes them
 #   - curl stubbed for the IP and geo lookups (MOCK_IP / MOCK_GEO_FILE,
 #     "fail" for either to make that lookup fail)
 #   - a 0.0.0.0/1 route via the docker gateway, with netem latency
-#     (MOCK_DELAY, default 100ms 10ms; "none" for no route)
+#     (MOCK_DELAY, default 50ms 5ms; "none" for no route)
 # Traffic: MOCK_TRAFFIC=on (default) / off.
 export DCN=${DCN:-jbx-mock} PORT=${PORT:-10079} OVPNFILE=${OVPNFILE:-example-gateway-sso.ovpn}
 export CONNCHECK=${CONNCHECK:-tunnel}
@@ -63,7 +63,13 @@ if [[ ${MOCK_TRAFFIC:-on} == on ]]; then
   disown
 fi
 
-echo "$(date) Initialization Sequence Completed" > /var/log/openvpn.log
+# What OpenVPN 2.7 logs on the way up, for the motd's tunnel details
+{
+  echo "$(date) UDPv4 link remote: [AF_INET]192.0.2.10:1194"
+  echo "$(date) Control Channel: TLSv1.3, cipher TLSv1.3 TLS_AES_256_GCM_SHA384, peer certificate: 256 bits ECprime256v1, signature: ecdsa-with-SHA256, key agreement: X25519MLKEM768"
+  echo "$(date) Data Channel: cipher 'AES-256-GCM', peer-id: 0"
+  echo "$(date) Initialization Sequence Completed"
+} > /var/log/openvpn.log
 echo $(( $(date +%s) - ${MOCK_UPTIME:-13963} )) > /tmp/last
 
 source /config/inc.sh

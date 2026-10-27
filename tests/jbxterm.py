@@ -255,6 +255,21 @@ def stream_errors(data):
     return found
 
 
+# Escape sequences, for measuring raw output: CSI, OSC, charset selection,
+# the two-byte ones, SI/SO
+ANSI = re.compile(rb"\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[()][0-9A-Za-z]|\x1b[@-Z\\-_]|[\x0e\x0f]")
+
+
+def line_widths(data):
+    """(cells, text) for every line of raw output (the motd's), escapes left
+    out and cells counted as the terminal counts them (cell_width)."""
+    out = []
+    for ln in data.split(b"\n"):
+        t = ANSI.sub(b"", ln).decode("utf-8", "replace").replace("\r", "")
+        out.append((sum(cell_width(ch) for ch in t), t))
+    return out
+
+
 # The preamble every paint (full or rows-only) starts with, as paintFrame writes it
 PAINT = b"\x1b\\\x1b[?6l\x1b[r\x0f\x1b(B\x1b[0m\x1b[?5l\x1b[4l\x1b[20l\x1b[?7l\x1b[?25l"
 # every paint (full or rows-only) ends by parking the cursor home
